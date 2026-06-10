@@ -3,8 +3,9 @@
 """
 KOSPI200 Put-to-Call Open Interest Ratio Monitor
 =================================================
-- KRX 정보데이터시스템에서 KOSPI200 옵션 전종목 미결제약정(콜/풋)을 수집해
-  P/C OI Ratio를 계산하고, Yahoo Finance에서 KOSPI200 지수를 병합한다.
+- 주소스: KIS(한국투자증권) Open API 옵션전광판 — 전 월물 콜/풋 OI 합산
+- 폴백: KRX 정보데이터시스템 (클라우드 IP 차단으로 로컬 실행 시에만 유효)
+- Yahoo Finance에서 KOSPI200 지수를 병합한다.
 - data/history.csv 에 누적 → docs/data.json 재생성 → Telegram 브리핑 발송.
 
 Usage:
@@ -287,6 +288,59 @@ def trading_day_candidates(start: datetime, lookback: int) -> list[str]:
     return out
 
 
+# ----------------------------------------------------------------------
+# KIS (주소스)
+# ----------------------------------------------------------------------
+def fetch_via_kis(date_str: str, history: list[dict]) -> dict | None:
+    """KIS 옵션전광판으로 전 월물 콜/풋 OI 합산. 실패/미설정 시 None.
+
+    공휴일 가드: 전광판 스냅샷이 직전 행과 콜·풋 모두 동일하면
+    휴장으로 간주(신규 데이터 아님)하고 None 반환.
+    """
+    try:
+        import source_kis
+        snap = source_kis.fetch_total_oi()
+    except Exception as e:
+        print(f"[WARN] KIS 수집 실패: {e}", file=sys.stderr)
+        return None
+    if history:
+        last = history[-1]
+        if (int(last.get("call_oi") or 0) == snap["call_oi"]
+                and int(last.get("put_oi") or 0) == snap["put_oi"]):
+            print("[SKIP] KIS OI가 직전 행과 동일 — 휴장 추정", file=sys.stderr)
+            return None
+    ratio = round(snap["put_oi"] / snap["call_oi"], 4)
+    if snap.get("truncated"):
+        print("[NOTE] 전광판 100행 한도 도달 월물 존재 — 극외가 일부 절단 가능",
+              file=sys.stderr)
+    print(f"[OK/KIS] {date_str} call={snap['call_oi']:,} put={snap['put_oi']:,} "
+          f"ratio={ratio} (months={len(snap['maturities'])})")
+    return {"date": date_str, "call_oi": snap["call_oi"],
+            "put_oi": snap["put_oi"], "pc_ratio": ratio, "k200": None}
+
+
+def notify_setup_needed(cfg: dict) -> None:
+    """데이터 소스 전부 실패 + 누적 0건일 때 1회성 설정 안내."""
+    msg = (
+        "⚙️ <b>KOSPI200 P/C 모니터 — 설정 필요</b>\n\n"
+        "KRX가 클라우드 IP를 차단하여 <b>한국투자증권(KIS) Open API</b>를 "
+        "주소스로 사용합니다. 아래 두 시크릿을 등록해 주세요.\n\n"
+        "1️⃣ https://apiportal.koreainvestment.com 에서 앱 등록 (무료)\n"
+        "2️⃣ 레포 Secrets에 추가:\n"
+        "   • <code>KIS_APP_KEY</code>\n"
+        "   • <code>KIS_APP_SECRET</code>\n"
+        "   → https://github.com/jinhae8971/kospi-putcall-monitor/settings/secrets/actions\n\n"
+        "등록 후 다음 평일 06:00(또는 Actions 수동 실행)부터 자동 수집됩니다."
+    )
+    if cfg["telegram_token"] and cfg["telegram_chat_id"]:
+        try:
+            send_telegram(msg, cfg["telegram_token"], cfg["telegram_chat_id"])
+            print("[DONE] 설정 안내 Telegram 발송")
+        except Exception as e:
+            print(f"[WARN] 안내 발송 실패: {e}", file=sys.stderr)
+    print("[INFO] KIS_APP_KEY/KIS_APP_SECRET 등록 필요 — 수집 생략", file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backfill", type=int, default=0,
@@ -322,25 +376,36 @@ def main() -> int:
                     time.sleep(0.8)
             d -= timedelta(days=1)
     else:
-        # 직전 거래일 1건: 어제부터 최대 7영업일 후보 탐색
-        got = False
-        for trd_dd in trading_day_candidates(now_kst - timedelta(days=1), 7):
-            ds = f"{trd_dd[:4]}-{trd_dd[4:6]}-{trd_dd[6:]}"
-            if ds in known_dates:
-                got = True  # 이미 보유 → 최신
-                break
-            res = fetch_pc_for_date(session, trd_dd)
-            if res is None:
-                print("[ERROR] KRX 데이터 수집 실패 (네트워크/차단)", file=sys.stderr)
-                return 2
-            if res:
-                new_rows.append(res)
-                got = True
-                break
-            time.sleep(0.5)
-        if not got:
-            print("[ERROR] 최근 7영업일 내 거래 데이터 없음", file=sys.stderr)
-            return 2
+        # ── 일일 수집: KIS(주소스) → KRX(폴백) ─────────────────────
+        # 06:00 KST 실행 시 KIS 전광판 OI = 직전 거래일 정규장 마감 스냅샷.
+        prev_td = trading_day_candidates(now_kst - timedelta(days=1), 1)[0]
+        prev_ds = f"{prev_td[:4]}-{prev_td[4:6]}-{prev_td[6:]}"
+
+        res = None
+        if prev_ds not in known_dates:
+            res = fetch_via_kis(prev_ds, history)
+            if res is None:  # KIS 실패/미설정 → KRX 폴백 (최대 7영업일 탐색)
+                for trd_dd in trading_day_candidates(now_kst - timedelta(days=1), 7):
+                    ds = f"{trd_dd[:4]}-{trd_dd[4:6]}-{trd_dd[6:]}"
+                    if ds in known_dates:
+                        break
+                    r = fetch_pc_for_date(session, trd_dd)
+                    if r is None:
+                        break  # KRX 차단
+                    if r:
+                        res = r
+                        break
+                    time.sleep(0.5)
+
+        if res:
+            new_rows.append(res)
+        elif prev_ds not in known_dates and not history:
+            # 양 소스 모두 실패 + 누적 데이터 없음 → 설정 안내 후 정상 종료
+            notify_setup_needed(cfg)
+            return 0
+        elif prev_ds not in known_dates:
+            print("[WARN] 신규 데이터 수집 실패 — 기존 누적분으로 브리핑 발송",
+                  file=sys.stderr)
 
     merged = {r["date"]: r for r in history}
     for r in new_rows:
