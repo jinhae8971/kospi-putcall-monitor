@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KOSPI200 Put/Call OI Monitor</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#151b24; --line:#222b38;
+    --txt:#dbe4ee; --dim:#7d8a9b;
+    --ratio:#f5a524;          /* 비율(주인공): 앰버 */
+    --k200:#e05c5c;           /* 지수: 한국 시장 관례 적색 계열 */
+    --ok:#3fb27f; --warn:#e0a13c; --danger:#e0524d;
+    font-size:15px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);
+       font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif;
+       padding:18px 14px 40px;max-width:980px;margin:0 auto}
+  .num{font-family:'SF Mono','JetBrains Mono',ui-monospace,Consolas,monospace;
+       font-variant-numeric:tabular-nums}
+  header{margin-bottom:14px}
+  .eyebrow{color:var(--dim);font-size:.78rem;letter-spacing:.14em;text-transform:uppercase}
+  h1{font-size:1.25rem;font-weight:700;margin-top:4px}
+  .updated{color:var(--dim);font-size:.78rem;margin-top:3px}
+
+  /* 시그니처: 임계 게이지 스트립 */
+  .gauge{position:relative;height:46px;border-radius:8px;margin:18px 0 6px;
+         background:linear-gradient(90deg,
+           var(--ok) 0%, var(--ok) 37%,
+           var(--warn) 50%, var(--warn) 62%,
+           var(--danger) 75%, #8e2723 100%);
+         opacity:.92}
+  .gauge .tick{position:absolute;top:100%;transform:translateX(-50%);
+               color:var(--dim);font-size:.7rem;padding-top:4px}
+  .gauge .marker{position:absolute;top:-10px;transform:translateX(-50%);
+                 width:3px;height:66px;background:#fff;border-radius:2px;
+                 box-shadow:0 0 8px rgba(255,255,255,.7)}
+  .gauge .marker .val{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
+                      background:#fff;color:#111;font-weight:700;font-size:.95rem;
+                      padding:2px 8px;border-radius:5px;white-space:nowrap;margin-bottom:4px}
+  .signal{margin:26px 0 18px;font-size:.92rem;font-weight:600}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .card .label{color:var(--dim);font-size:.74rem;margin-bottom:6px}
+  .card .value{font-size:1.3rem;font-weight:700}
+  .card .sub{font-size:.78rem;color:var(--dim);margin-top:3px}
+  .up{color:var(--danger)} .down{color:#5b8fe0}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 14px}
+  .toolbar{display:flex;gap:6px;justify-content:flex-end;margin-bottom:10px}
+  .toolbar button{background:transparent;border:1px solid var(--line);color:var(--dim);
+                  border-radius:6px;padding:4px 12px;font-size:.78rem;cursor:pointer}
+  .toolbar button.active{background:var(--ratio);border-color:var(--ratio);color:#1a1205;font-weight:700}
+  #chartWrap{position:relative;height:380px}
+  @media(max-width:600px){#chartWrap{height:300px}}
+  footer{color:var(--dim);font-size:.74rem;margin-top:16px;line-height:1.7}
+  a{color:var(--ratio)}
+  .err{color:var(--danger);padding:30px 0;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div class="eyebrow">KOSPI200 Options · Open Interest</div>
+  <h1>풋/콜 미결제약정 비율 모니터</h1>
+  <div class="updated" id="updated">불러오는 중…</div>
+</header>
+
+<div class="gauge" id="gauge">
+  <div class="tick" style="left:0%">0.5</div>
+  <div class="tick" style="left:37%">1.5</div>
+  <div class="tick" style="left:56%">2.0</div>
+  <div class="tick" style="left:75%">2.5</div>
+  <div class="tick" style="left:100%">3.2</div>
+  <div class="marker" id="marker" style="left:0%"><span class="val num" id="markerVal">–</span></div>
+</div>
+<div class="signal" id="signal"></div>
+
+<div class="cards">
+  <div class="card"><div class="label">P/C OI Ratio</div>
+    <div class="value num" id="cRatio">–</div><div class="sub" id="cRatioSub"></div></div>
+  <div class="card"><div class="label">1년 백분위</div>
+    <div class="value num" id="cPct">–</div><div class="sub">trailing 1Y 기준</div></div>
+  <div class="card"><div class="label">KOSPI200</div>
+    <div class="value num" id="cK200">–</div><div class="sub" id="cK200Sub"></div></div>
+  <div class="card"><div class="label">풋 / 콜 OI</div>
+    <div class="value num" id="cOI" style="font-size:1.02rem">–</div><div class="sub">계약 수</div></div>
+</div>
+
+<div class="panel">
+  <div class="toolbar" id="ranges">
+    <button data-d="90">3M</button>
+    <button data-d="180" class="active">6M</button>
+    <button data-d="365">1Y</button>
+    <button data-d="0">All</button>
+  </div>
+  <div id="chartWrap"><canvas id="chart"></canvas></div>
+</div>
+
+<footer>
+  데이터: KRX 정보데이터시스템 (KOSPI200 옵션 정규월물 미결제약정), Yahoo Finance (^KS200) ·
+  매 평일 06:00 KST 자동 갱신 · 점선 = 2.5 (과거 급락 선행 극단 레벨) ·
+  본 정보는 투자 참고용입니다.
+</footer>
+
+<script>
+const GMIN=0.5, GMAX=3.2;
+let DATA=null, chart=null, rangeDays=180;
+
+function fmt(n,d=3){return n==null?'–':Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});}
+function pctRank(arr,t){if(!arr.length)return 0;return (100*arr.filter(v=>v<=t).length/arr.length).toFixed(1);}
+
+function render(){
+  const s=DATA.series.filter(r=>r.pc_ratio!=null);
+  if(!s.length){document.body.insertAdjacentHTML('beforeend','<div class="err">데이터가 아직 없습니다. 첫 수집 후 표시됩니다.</div>');return;}
+  const last=s[s.length-1], prev=s[s.length-2];
+  document.getElementById('updated').textContent=`기준일 ${last.date} · 갱신 ${DATA.updated_at}`;
+
+  // 게이지
+  const pos=Math.max(0,Math.min(1,(last.pc_ratio-GMIN)/(GMAX-GMIN)))*100;
+  document.getElementById('marker').style.left=pos+'%';
+  document.getElementById('markerVal').textContent=fmt(last.pc_ratio,3);
+
+  const r=last.pc_ratio;
+  const sig= r>=2.5 ? ['🔴 극단 구간 (≥2.5) — 역사적으로 급락에 선행했던 레벨','var(--danger)']
+          : r>=2.0 ? ['🟠 경계 구간 (≥2.0) — 풋 미결제 과열 진행','var(--warn)']
+          : r>=1.5 ? ['🟡 중립 상단 (≥1.5)','var(--warn)']
+                   : ['🟢 정상 구간','var(--ok)'];
+  const el=document.getElementById('signal'); el.textContent=sig[0]; el.style.color=sig[1];
+
+  // 카드
+  document.getElementById('cRatio').textContent=fmt(r,3);
+  if(prev){const d=r-prev.pc_ratio;
+    document.getElementById('cRatioSub').innerHTML=
+      `<span class="${d>=0?'up':'down'}">${d>=0?'▲':'▼'} ${fmt(Math.abs(d),3)}</span> vs 전일`;}
+  const cutoff=new Date(last.date); cutoff.setDate(cutoff.getDate()-365);
+  const tr=s.filter(x=>new Date(x.date)>=cutoff).map(x=>x.pc_ratio);
+  document.getElementById('cPct').textContent=pctRank(tr,r)+'%';
+  document.getElementById('cK200').textContent=last.k200?fmt(last.k200,2):'–';
+  if(prev&&last.k200&&prev.k200){const c=(last.k200/prev.k200-1)*100;
+    document.getElementById('cK200Sub').innerHTML=
+      `<span class="${c>=0?'up':'down'}">${c>=0?'+':''}${c.toFixed(2)}%</span> 전일 대비`;}
+  document.getElementById('cOI').textContent=
+    `${last.put_oi.toLocaleString()} / ${last.call_oi.toLocaleString()}`;
+
+  drawChart();
+}
+
+function drawChart(){
+  const all=DATA.series.filter(r=>r.pc_ratio!=null);
+  const s=rangeDays>0?all.slice(-rangeDays):all;
+  const labels=s.map(r=>r.date);
+  if(chart)chart.destroy();
+  chart=new Chart(document.getElementById('chart'),{
+    type:'line',
+    data:{labels,datasets:[
+      {label:'P/C OI Ratio',data:s.map(r=>r.pc_ratio),yAxisID:'y1',
+       borderColor:'#f5a524',backgroundColor:'rgba(245,165,36,.08)',
+       borderWidth:1.8,pointRadius:s.map(r=>r.pc_ratio>=2.5?3.5:0),
+       pointBackgroundColor:'#e0524d',fill:true,tension:.18},
+      {label:'KOSPI200',data:s.map(r=>r.k200),yAxisID:'y2',
+       borderColor:'#e05c5c',borderWidth:1.4,pointRadius:0,tension:.18},
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{labels:{color:'#dbe4ee',boxWidth:18,font:{size:11}}},
+        tooltip:{backgroundColor:'#1c2530',borderColor:'#222b38',borderWidth:1},
+        annotation:undefined
+      },
+      scales:{
+        x:{ticks:{color:'#7d8a9b',maxTicksLimit:8,font:{size:10}},grid:{color:'rgba(125,138,155,.08)'}},
+        y1:{position:'right',title:{display:true,text:'Ratio',color:'#f5a524'},
+            ticks:{color:'#f5a524',font:{size:10}},grid:{color:'rgba(125,138,155,.1)'}},
+        y2:{position:'left',title:{display:true,text:'KOSPI200',color:'#e05c5c'},
+            ticks:{color:'#e05c5c',font:{size:10}},grid:{display:false}},
+      }
+    },
+    plugins:[{
+      id:'threshold',
+      afterDraw(c){
+        const y=c.scales.y1.getPixelForValue(2.5);
+        if(y<c.chartArea.top||y>c.chartArea.bottom)return;
+        const ctx=c.ctx;ctx.save();ctx.setLineDash([5,4]);
+        ctx.strokeStyle='rgba(224,82,77,.85)';ctx.lineWidth=1;
+        ctx.beginPath();ctx.moveTo(c.chartArea.left,y);ctx.lineTo(c.chartArea.right,y);ctx.stroke();
+        ctx.fillStyle='rgba(224,82,77,.9)';ctx.font='10px monospace';
+        ctx.fillText('2.5 extreme',c.chartArea.left+6,y-5);ctx.restore();
+      }
+    }]
+  });
+}
+
+document.getElementById('ranges').addEventListener('click',e=>{
+  if(e.target.tagName!=='BUTTON')return;
+  document.querySelectorAll('#ranges button').forEach(b=>b.classList.remove('active'));
+  e.target.classList.add('active');
+  rangeDays=parseInt(e.target.dataset.d,10);
+  drawChart();
+});
+
+fetch('data.json?v='+Date.now())
+  .then(r=>{if(!r.ok)throw new Error(r.status);return r.json();})
+  .then(j=>{DATA=j;render();})
+  .catch(()=>{document.getElementById('updated').textContent='data.json 로드 실패 — 첫 수집 전이거나 Pages 배포 대기 중입니다.';});
+</script>
+</body>
+</html>
