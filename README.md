@@ -17,3 +17,16 @@ Actions → "KOSPI200 Put-Call Daily Brief" → Run workflow → `backfill_days`
 
 ## Secrets
 `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
+
+## 데이터 소스 (우선순위)
+
+| 순위 | 소스 | 요건 | 비고 |
+|---|---|---|---|
+| 1 | **KRX OpenAPI** `drv/opt_bydd_trd` | `KRX_OPENAPI_KEY` (무료, 증권사 무관) | 클라우드 IP 차단 없음 · T-1 · 백필 지원 |
+| 2 | KIS Open API 옵션전광판 | `KIS_APP_KEY`/`KIS_APP_SECRET` | 계좌 필요 · 당일 스냅샷 |
+| 3 | KRX 정보데이터시스템 | 없음 | 국내 IP 전용 (로컬 백필용) |
+
+### KRX OpenAPI 인증키 발급 (5분)
+1. https://openapi.krx.co.kr 회원가입
+2. **API 이용신청** → 파생상품 → **옵션 일별매매정보** 신청
+3. 발급 인증키를 레포 Secrets `KRX_OPENAPI_KEY` 로 등록

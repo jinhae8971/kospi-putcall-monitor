@@ -3,8 +3,9 @@
 """
 KOSPI200 Put-to-Call Open Interest Ratio Monitor
 =================================================
-- 주소스: KIS(한국투자증권) Open API 옵션전광판 — 전 월물 콜/풋 OI 합산
-- 폴백: KRX 정보데이터시스템 (클라우드 IP 차단으로 로컬 실행 시에만 유효)
+- 주소스: KRX OpenAPI(Data Marketplace) drv/opt_bydd_trd — 증권사 무관, 무료 인증키
+- 폴백1: KIS Open API 옵션전광판 (시크릿 등록 시)
+- 폴백2: KRX 정보데이터시스템 (클라우드 IP 차단 → 로컬 실행 시에만 유효)
 - Yahoo Finance에서 KOSPI200 지수를 병합한다.
 - data/history.csv 에 누적 → docs/data.json 재생성 → Telegram 브리핑 발송.
 
@@ -46,6 +47,7 @@ def load_config() -> dict:
         "telegram_token": os.environ.get("TELEGRAM_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
         "pages_url": os.environ.get("PAGES_URL", ""),
+        "krx_openapi_key": os.environ.get("KRX_OPENAPI_KEY", ""),
     }
     config_path = os.path.join(BASE_DIR, "config.json")
     if os.path.exists(config_path):
@@ -291,6 +293,25 @@ def trading_day_candidates(start: datetime, lookback: int) -> list[str]:
 # ----------------------------------------------------------------------
 # KIS (주소스)
 # ----------------------------------------------------------------------
+def fetch_via_krx_openapi(trd_dd: str, auth_key: str) -> dict | None:
+    """KRX OpenAPI로 특정 거래일 콜/풋 OI 수집. (주소스)
+
+    Returns: dict(데이터) / {}(휴장) / None(소스 사용 불가)
+    """
+    if not auth_key:
+        return None
+    import source_krx_openapi
+    res = source_krx_openapi.fetch_pc(trd_dd, auth_key)
+    if not res:
+        return res  # None(오류) 또는 {}(휴장) 그대로 전달
+    ds = f"{trd_dd[:4]}-{trd_dd[4:6]}-{trd_dd[6:]}"
+    ratio = round(res["put_oi"] / res["call_oi"], 4)
+    print(f"[OK/KRX-OpenAPI] {ds} call={res['call_oi']:,} "
+          f"put={res['put_oi']:,} ratio={ratio}")
+    return {"date": ds, "call_oi": res["call_oi"], "put_oi": res["put_oi"],
+            "pc_ratio": ratio, "k200": None}
+
+
 def fetch_via_kis(date_str: str, history: list[dict]) -> dict | None:
     """KIS 옵션전광판으로 전 월물 콜/풋 OI 합산. 실패/미설정 시 None.
 
@@ -323,14 +344,13 @@ def notify_setup_needed(cfg: dict) -> None:
     """데이터 소스 전부 실패 + 누적 0건일 때 1회성 설정 안내."""
     msg = (
         "⚙️ <b>KOSPI200 P/C 모니터 — 설정 필요</b>\n\n"
-        "KRX가 클라우드 IP를 차단하여 <b>한국투자증권(KIS) Open API</b>를 "
-        "주소스로 사용합니다. 아래 두 시크릿을 등록해 주세요.\n\n"
-        "1️⃣ https://apiportal.koreainvestment.com 에서 앱 등록 (무료)\n"
-        "2️⃣ 레포 Secrets에 추가:\n"
-        "   • <code>KIS_APP_KEY</code>\n"
-        "   • <code>KIS_APP_SECRET</code>\n"
+        "증권사 계좌 없이 <b>KRX OpenAPI 무료 인증키</b>만으로 작동합니다.\n\n"
+        "1️⃣ https://openapi.krx.co.kr 회원가입 (무료)\n"
+        "2️⃣ [API 이용신청] → 파생상품 → <b>옵션 일별매매정보</b> 신청\n"
+        "3️⃣ 발급된 인증키를 레포 Secrets에 등록:\n"
+        "   • <code>KRX_OPENAPI_KEY</code>\n"
         "   → https://github.com/jinhae8971/kospi-putcall-monitor/settings/secrets/actions\n\n"
-        "등록 후 다음 평일 06:00(또는 Actions 수동 실행)부터 자동 수집됩니다."
+        "등록 후 Actions 수동 실행 또는 다음 평일 06:00부터 자동 수집됩니다."
     )
     if cfg["telegram_token"] and cfg["telegram_chat_id"]:
         try:
@@ -338,7 +358,7 @@ def notify_setup_needed(cfg: dict) -> None:
             print("[DONE] 설정 안내 Telegram 발송")
         except Exception as e:
             print(f"[WARN] 안내 발송 실패: {e}", file=sys.stderr)
-    print("[INFO] KIS_APP_KEY/KIS_APP_SECRET 등록 필요 — 수집 생략", file=sys.stderr)
+    print("[INFO] KRX_OPENAPI_KEY 등록 필요 — 수집 생략", file=sys.stderr)
 
 
 def main() -> int:
@@ -363,9 +383,13 @@ def main() -> int:
             if d.weekday() < 5:
                 ds = d.strftime("%Y-%m-%d")
                 if ds not in known_dates:
-                    res = fetch_pc_for_date(session, d.strftime("%Y%m%d"))
+                    trd = d.strftime("%Y%m%d")
+                    if cfg.get("krx_openapi_key"):
+                        res = fetch_via_krx_openapi(trd, cfg["krx_openapi_key"])
+                    else:
+                        res = fetch_pc_for_date(session, trd)
                     if res is None:
-                        print(f"[ERROR] KRX unreachable at {ds}; aborting backfill.",
+                        print(f"[ERROR] 데이터 소스 사용 불가 at {ds}; aborting backfill.",
                               file=sys.stderr)
                         break
                     if res:
@@ -373,7 +397,7 @@ def main() -> int:
                         print(f"[OK] {ds} ratio={res['pc_ratio']}")
                     else:
                         print(f"[SKIP] {ds} holiday")
-                    time.sleep(0.8)
+                    time.sleep(0.4)
             d -= timedelta(days=1)
     else:
         # ── 일일 수집: KIS(주소스) → KRX(폴백) ─────────────────────
@@ -383,8 +407,23 @@ def main() -> int:
 
         res = None
         if prev_ds not in known_dates:
-            res = fetch_via_kis(prev_ds, history)
-            if res is None:  # KIS 실패/미설정 → KRX 폴백 (최대 7영업일 탐색)
+            # 1순위: KRX OpenAPI — 최대 7영업일 소급 (연휴 대응)
+            if cfg.get("krx_openapi_key"):
+                for trd_dd in trading_day_candidates(now_kst - timedelta(days=1), 7):
+                    ds = f"{trd_dd[:4]}-{trd_dd[4:6]}-{trd_dd[6:]}"
+                    if ds in known_dates:
+                        break
+                    r = fetch_via_krx_openapi(trd_dd, cfg["krx_openapi_key"])
+                    if r is None:
+                        break  # 인증/통신 오류 → 다음 소스로
+                    if r:
+                        res = r
+                        break
+                    time.sleep(0.4)
+            # 2순위: KIS 옵션전광판
+            if res is None:
+                res = fetch_via_kis(prev_ds, history)
+            if res is None:  # 3순위: KRX 데이터시스템 (로컬 IP 전용)
                 for trd_dd in trading_day_candidates(now_kst - timedelta(days=1), 7):
                     ds = f"{trd_dd[:4]}-{trd_dd[4:6]}-{trd_dd[6:]}"
                     if ds in known_dates:
