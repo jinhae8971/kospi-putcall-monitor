@@ -3,43 +3,38 @@ on: workflow_dispatch
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
-      - name: Probe data sources from runner IP
+      - name: Probe Naver option endpoints
         run: |
           python3 - <<'PYEOF'
-          import requests, json
+          import requests, re
           UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
-                'Accept-Language': 'ko-KR,ko;q=0.9'}
+                'Accept-Language': 'ko-KR,ko;q=0.9', 'Referer': 'https://finance.naver.com/'}
 
-          def test(name, method, url, **kw):
+          # 1. 선물옵션 메뉴 페이지에서 옵션 관련 링크 발굴
+          for seed in ['https://finance.naver.com/sise/', 'https://finance.naver.com/fut_opt/']:
               try:
-                  r = requests.request(method, url, timeout=12, headers={**UA, **kw.pop('headers', {})}, **kw)
-                  body = r.text[:150].replace(chr(10), ' ')
-                  print(f"[{name}] HTTP {r.status_code} len={len(r.text)} | {body}")
+                  r = requests.get(seed, headers=UA, timeout=12)
+                  links = sorted(set(re.findall(r'href="([^"]*(?:option|opt|fut)[^"]*)"', r.text, re.I)))[:15]
+                  print(f"[SEED {seed}] {r.status_code} links={links}")
               except Exception as e:
-                  print(f"[{name}] EXC {type(e).__name__}: {e}")
+                  print(f"[SEED {seed}] EXC {e}")
 
-          # 1. KRX 게스트 (재확인)
-          test('KRX-guest', 'POST', 'https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd',
-               data={'bld':'dbms/MDC/STAT/standard/MDCSTAT12501','locale':'ko_KR','trdDd':'20260610',
-                     'prodId':'KRDRVOPK2I','mktTpCd':'T','rghtTpCd':'T','csvxls_isNo':'false'},
-               headers={'Referer':'https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd'})
-
-          # 2. 네이버 금융 옵션 (데스크톱)
-          test('NAVER-option', 'GET', 'https://finance.naver.com/option/')
-
-          # 3. 네이버 모바일 API
-          test('NAVER-mobile', 'GET', 'https://m.stock.naver.com/api/index/KOSPI200/basic')
-
-          # 4. 네이버 폴링 API
-          test('NAVER-polling', 'GET', 'https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI200')
-
-          # 5. 다음 금융
-          test('DAUM', 'GET', 'https://finance.daum.net/api/quotes/KOREA-D0011?summary=false',
-               headers={'Referer':'https://finance.daum.net/domestic'})
-
-          # 6. 공공데이터포털 게이트웨이
-          test('DATA-GO-KR', 'GET', 'https://apis.data.go.kr/1160100/service/GetDerivativeProductInfoService/getOptionsPriceInfo',
-               params={'serviceKey':'DUMMY','resultType':'json'})
+          # 2. 후보 URL 직접 타격
+          cands = [
+            'https://finance.naver.com/sise/sise_option.naver',
+            'https://finance.naver.com/option/option_list.naver',
+            'https://finance.naver.com/fut_opt/option.naver',
+            'https://m.stock.naver.com/api/futures/list?page=1&pageSize=5',
+            'https://m.stock.naver.com/api/option/list?page=1&pageSize=5',
+            'https://api.stock.naver.com/futures/option/KOSPI200',
+            'https://m.stock.naver.com/front-api/option/board?category=index',
+          ]
+          for u in cands:
+              try:
+                  r = requests.get(u, headers=UA, timeout=12)
+                  print(f"[{u}] {r.status_code} len={len(r.text)} | {r.text[:100].replace(chr(10),' ')}")
+              except Exception as e:
+                  print(f"[{u}] EXC {type(e).__name__}")
           PYEOF
