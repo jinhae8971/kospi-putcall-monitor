@@ -1,0 +1,137 @@
+name: KRX API Activation Watch
+
+# KRX OpenAPI 이용신청 승인을 매시간 감지하여, 승인 즉시:
+#   1) daily.yml 재가동(enable)
+#   2) 중앙 대시보드 정지 의도 해제 (paused.json / systems.yaml)
+#   3) 730일 백필 → 일일 브리핑 순차 디스패치 (concurrency로 직렬화됨)
+#   4) Telegram 활성화 알림 → 워처 자가 비활성화
+# 7일 내 승인이 안 되면 알림 후 자가 종료.
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: activation-watch
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe & activate
+        env:
+          KRX_OPENAPI_KEY: ${{ secrets.KRX_OPENAPI_KEY }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip -q install requests pyyaml
+          python - <<'PYEOF'
+          import base64, json, os, sys, time
+          from datetime import datetime, timedelta, timezone
+          import requests, yaml
+
+          KST = timezone(timedelta(hours=9))
+          KEY = os.environ["KRX_OPENAPI_KEY"]
+          PAT = os.environ["GH_PAT"]
+          GHT = os.environ["GH_TOKEN"]
+          API = "https://api.github.com"
+          REPO = "jinhae8971/kospi-putcall-monitor"
+          DASH = "jinhae8971/github-actions-dashboard"
+          H_PAT = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github+json"}
+          H_GHT = {"Authorization": f"token {GHT}", "Accept": "application/vnd.github+json"}
+
+          def tg(text):
+              try:
+                  requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendMessage",
+                                json={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text,
+                                      "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+              except Exception as e:
+                  print(f"[WARN] telegram: {e}")
+
+          def wf_id(repo, path_part, headers):
+              r = requests.get(f"{API}/repos/{repo}/actions/workflows", headers=headers, timeout=15)
+              for w in r.json()["workflows"]:
+                  if path_part in w["path"]:
+                      return w["id"]
+              return None
+
+          def self_disable():
+              wid = wf_id(REPO, "activation-watch", H_GHT)
+              if wid:
+                  requests.put(f"{API}/repos/{REPO}/actions/workflows/{wid}/disable",
+                               headers=H_GHT, timeout=15)
+                  print("[DONE] 워처 자가 비활성화")
+
+          # ── 0) 7일 만료 가드 ──────────────────────────────────────
+          DEADLINE = datetime(2026, 6, 18, tzinfo=KST)
+          if datetime.now(KST) > DEADLINE:
+              tg("⏰ KRX OpenAPI 승인이 7일 내 확인되지 않아 워처를 종료합니다.\n"
+                 "openapi.krx.co.kr 마이페이지에서 신청 상태를 확인해 주세요.")
+              self_disable()
+              sys.exit(0)
+
+          # ── 1) 승인 프로브 ────────────────────────────────────────
+          r = requests.get("http://data-dbg.krx.co.kr/svc/apis/drv/opt_bydd_trd",
+                           params={"basDd": "20260610"}, headers={"AUTH_KEY": KEY}, timeout=20)
+          print(f"probe: HTTP {r.status_code} | {r.text[:100]}")
+          if r.status_code != 200:
+              print("[WAIT] 아직 미승인 — 다음 주기 재시도")
+              sys.exit(0)
+          rows = r.json().get("OutBlock_1", [])
+          if not rows:
+              print("[WAIT] 200이나 데이터 비어있음 — 재시도")
+              sys.exit(0)
+
+          print(f"[GO] 승인 감지! rows={len(rows)} — 전체 활성화 시작")
+
+          # ── 2) daily.yml 재가동 ───────────────────────────────────
+          did = wf_id(REPO, "daily.yml", H_GHT)
+          requests.put(f"{API}/repos/{REPO}/actions/workflows/{did}/enable", headers=H_GHT, timeout=15)
+          print(f"[DONE] daily.yml enable (id={did})")
+
+          # ── 3) 대시보드 정지 의도 해제 ────────────────────────────
+          # paused.json에서 항목 제거
+          pj = requests.get(f"{API}/repos/{DASH}/contents/data/paused.json", headers=H_PAT, timeout=15).json()
+          paused = json.loads(base64.b64decode(pj["content"]).decode())
+          paused.pop(str(did), None)
+          requests.put(f"{API}/repos/{DASH}/contents/data/paused.json", headers=H_PAT, json={
+              "message": "chore: resume kospi-putcall-monitor (KRX API approved)",
+              "content": base64.b64encode(json.dumps(paused, ensure_ascii=False, indent=2).encode()).decode(),
+              "sha": pj["sha"]}, timeout=20)
+          # systems.yaml에서 expected_state: paused 제거
+          sy = requests.get(f"{API}/repos/{DASH}/contents/config/systems.yaml", headers=H_PAT, timeout=15).json()
+          txt = base64.b64decode(sy["content"]).decode()
+          new_txt = txt.replace("    repo: kospi-putcall-monitor\n    expected_state: paused\n",
+                                "    repo: kospi-putcall-monitor\n")
+          yaml.safe_load(new_txt)  # 유효성 가드
+          requests.put(f"{API}/repos/{DASH}/contents/config/systems.yaml", headers=H_PAT, json={
+              "message": "chore: kospi-putcall-monitor active (KRX API approved)",
+              "content": base64.b64encode(new_txt.encode()).decode(),
+              "sha": sy["sha"]}, timeout=20)
+          print("[DONE] 대시보드 정지 의도 해제")
+
+          # ── 4) 백필(730일) → 일일 브리핑 순차 디스패치 ─────────────
+          time.sleep(3)
+          requests.post(f"{API}/repos/{REPO}/actions/workflows/{did}/dispatches", headers=H_GHT,
+                        json={"ref": "main", "inputs": {"backfill_days": "730"}}, timeout=15)
+          time.sleep(5)
+          requests.post(f"{API}/repos/{REPO}/actions/workflows/{did}/dispatches", headers=H_GHT,
+                        json={"ref": "main", "inputs": {"backfill_days": "0"}}, timeout=15)
+          print("[DONE] 백필 + 일일 브리핑 디스패치 (concurrency 직렬 실행)")
+
+          # ── 5) 알림 + 자가 종료 ───────────────────────────────────
+          tg("🟢 <b>KRX OpenAPI 승인 감지 — P/C 모니터 자동 활성화</b>\n\n"
+             "• 평일 06:00 브리핑 재가동 완료\n"
+             "• 730일 백필 실행 중 (완료 후 첫 브리핑 자동 발송)\n"
+             "• 대시보드: https://jinhae8971.github.io/kospi-putcall-monitor/")
+          self_disable()
+          PYEOF
