@@ -1,0 +1,45 @@
+name: Source Probe (one-time)
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe data sources from runner IP
+        run: |
+          python3 - <<'PYEOF'
+          import requests, json
+          UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+                'Accept-Language': 'ko-KR,ko;q=0.9'}
+
+          def test(name, method, url, **kw):
+              try:
+                  r = requests.request(method, url, timeout=12, headers={**UA, **kw.pop('headers', {})}, **kw)
+                  body = r.text[:150].replace(chr(10), ' ')
+                  print(f"[{name}] HTTP {r.status_code} len={len(r.text)} | {body}")
+              except Exception as e:
+                  print(f"[{name}] EXC {type(e).__name__}: {e}")
+
+          # 1. KRX 게스트 (재확인)
+          test('KRX-guest', 'POST', 'https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd',
+               data={'bld':'dbms/MDC/STAT/standard/MDCSTAT12501','locale':'ko_KR','trdDd':'20260610',
+                     'prodId':'KRDRVOPK2I','mktTpCd':'T','rghtTpCd':'T','csvxls_isNo':'false'},
+               headers={'Referer':'https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd'})
+
+          # 2. 네이버 금융 옵션 (데스크톱)
+          test('NAVER-option', 'GET', 'https://finance.naver.com/option/')
+
+          # 3. 네이버 모바일 API
+          test('NAVER-mobile', 'GET', 'https://m.stock.naver.com/api/index/KOSPI200/basic')
+
+          # 4. 네이버 폴링 API
+          test('NAVER-polling', 'GET', 'https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI200')
+
+          # 5. 다음 금융
+          test('DAUM', 'GET', 'https://finance.daum.net/api/quotes/KOREA-D0011?summary=false',
+               headers={'Referer':'https://finance.daum.net/domestic'})
+
+          # 6. 공공데이터포털 게이트웨이
+          test('DATA-GO-KR', 'GET', 'https://apis.data.go.kr/1160100/service/GetDerivativeProductInfoService/getOptionsPriceInfo',
+               params={'serviceKey':'DUMMY','resultType':'json'})
+          PYEOF
